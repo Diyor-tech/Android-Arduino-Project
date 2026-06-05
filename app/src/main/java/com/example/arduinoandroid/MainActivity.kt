@@ -527,24 +527,37 @@ class SupabaseCloudRepository(
         )
 
         val array = JSONArray(response)
-        if (array.length() == 0)
-        {
-            return (1..4).map { number ->
-                val plant = plants[(number - 1) % plants.size]
-                IrrigationZone(number, "Зона $number", plant, plant.waterNeed, true)
-            }
-        }
 
-        return (0 until array.length()).map { index ->
-            val item = array.getJSONObject(index)
-            val plant = plants.firstOrNull { it.id == item.optString("plant_id") } ?: plants.first()
-            IrrigationZone(
-                zoneNumber = item.getInt("zone_number"),
-                name = item.optString("name", "Зона ${item.getInt("zone_number")}"),
-                plant = plant,
-                customWaterNeed = item.optInt("custom_water_need", plant.waterNeed),
-                enabled = item.optBoolean("enabled", true)
-            )
+        val savedZonesByNumber = (0 until array.length())
+            .map { index -> array.getJSONObject(index) }
+            .associateBy { item -> item.getInt("zone_number") }
+
+        return (1..4).map { number ->
+            val savedZone = savedZonesByNumber[number]
+            val defaultPlant = plants[(number - 1) % plants.size]
+
+            if (savedZone == null)
+            {
+                IrrigationZone(
+                    zoneNumber = number,
+                    name = "Зона $number",
+                    plant = defaultPlant,
+                    customWaterNeed = defaultPlant.waterNeed,
+                    enabled = true
+                )
+            }
+            else
+            {
+                val plant = plants.firstOrNull { it.id == savedZone.optString("plant_id") } ?: defaultPlant
+
+                IrrigationZone(
+                    zoneNumber = number,
+                    name = savedZone.optString("name", "Зона $number"),
+                    plant = plant,
+                    customWaterNeed = savedZone.optInt("custom_water_need", plant.waterNeed),
+                    enabled = savedZone.optBoolean("enabled", true)
+                )
+            }
         }
     }
 
@@ -1745,8 +1758,10 @@ fun ConnectionCard(
 {
     var isConnectionBlockExpanded by remember { mutableStateOf(true) }
 
-    LaunchedEffect(arduinoState) {
-        if (arduinoState is ArduinoConnectionState.Connected)
+    val isConnected = arduinoState is ArduinoConnectionState.Connected
+
+    LaunchedEffect(isConnected) {
+        if (isConnected)
         {
             isConnectionBlockExpanded = false
         }
@@ -1780,7 +1795,7 @@ fun ConnectionCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                ConnectionDot(connected = arduinoState is ArduinoConnectionState.Connected)
+                ConnectionDot(connected = isConnected)
 
                 Text(
                     text = statusText,
