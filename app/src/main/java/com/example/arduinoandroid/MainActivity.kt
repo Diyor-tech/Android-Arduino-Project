@@ -76,6 +76,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -241,6 +243,14 @@ data class WifiNetworkItem(
     val signalLevel: Int
 )
 
+data class ControllerConnectionConfig(
+    val deviceCode: String,
+    val deviceName: String,
+    val wifiSsid: String,
+    val wifiPassword: String,
+    val baseUrl: String
+)
+
 sealed class ArduinoConnectionState
 {
     object Disconnected : ArduinoConnectionState()
@@ -303,6 +313,7 @@ interface CloudRepository
     suspend fun restore(savedAuth: SavedAuth): CloudSession
     suspend fun loadPlants(session: CloudSession): List<PlantWaterNeed>
     suspend fun loadZones(session: CloudSession, plants: List<PlantWaterNeed>): List<IrrigationZone>
+    suspend fun loadControllerByCode(session: CloudSession, deviceCode: String): ControllerConnectionConfig
     suspend fun saveZone(session: CloudSession, zone: IrrigationZone)
 }
 
@@ -376,6 +387,26 @@ class DemoCloudRepository(context: Context) : CloudRepository
                 plant = plant,
                 customWaterNeed = prefs.getInt("zone_${number}_need", plant.waterNeed),
                 enabled = prefs.getBoolean("zone_${number}_enabled", true)
+            )
+        }
+
+    override suspend fun loadControllerByCode(
+        session: CloudSession,
+        deviceCode: String
+    ): ControllerConnectionConfig =
+        withContext(Dispatchers.IO)
+        {
+            if (!deviceCode.trim().equals("IRR-1001", ignoreCase = true))
+            {
+                throw IllegalArgumentException("Контроллер с таким кодом не найден.")
+            }
+
+            ControllerConnectionConfig(
+                deviceCode = "IRR-1001",
+                deviceName = "Демо-контроллер орошения",
+                wifiSsid = AppConfig.DEFAULT_ARDUINO_SSID,
+                wifiPassword = AppConfig.DEFAULT_ARDUINO_PASSWORD,
+                baseUrl = AppConfig.DEFAULT_ARDUINO_BASE_URL
             )
         }
 
@@ -517,11 +548,46 @@ class SupabaseCloudRepository(
         }
     }
 
+    override suspend fun loadControllerByCode(
+        session: CloudSession,
+        deviceCode: String
+    ): ControllerConnectionConfig
+    {
+        val trimmedCode = deviceCode.trim()
+        if (trimmedCode.isBlank())
+        {
+            throw IllegalArgumentException("Введите код контроллера.")
+        }
+
+        val encodedCode = URLEncoder.encode(trimmedCode, StandardCharsets.UTF_8.name())
+        val response = httpText(
+            method = "GET",
+            path = "/rest/v1/controllers?select=device_code,device_name,wifi_ssid,wifi_password,base_url&device_code=eq.$encodedCode&is_active=eq.true&limit=1",
+            token = session.accessToken
+        )
+
+        val array = JSONArray(response)
+        if (array.length() == 0)
+        {
+            throw IllegalArgumentException("Контроллер с таким кодом не найден или не привязан к вашему аккаунту.")
+        }
+
+        val item = array.getJSONObject(0)
+
+        return ControllerConnectionConfig(
+            deviceCode = item.getString("device_code"),
+            deviceName = item.optString("device_name", "Контроллер орошения"),
+            wifiSsid = item.getString("wifi_ssid"),
+            wifiPassword = item.optString("wifi_password", ""),
+            baseUrl = item.optString("base_url", AppConfig.DEFAULT_ARDUINO_BASE_URL)
+        )
+    }
+
     override suspend fun saveZone(session: CloudSession, zone: IrrigationZone)
     {
         httpText(
             method = "POST",
-            path = "/rest/v1/user_zones",
+            path = "/rest/v1/user_zones?on_conflict=user_id,zone_number",
             token = session.accessToken,
             extraHeaders = mapOf("Prefer" to "resolution=merge-duplicates,return=minimal"),
             body = JSONObject()
@@ -923,6 +989,7 @@ fun IrrigationApp(
     var message by remember { mutableStateOf("") }
 
     val scope = rememberCoroutineScope()
+    val arduinoRequestMutex = remember { Mutex() }
 
     DisposableEffect(Unit) {
         onDispose { arduinoConnection.disconnect() }
@@ -946,6 +1013,32 @@ fun IrrigationApp(
             {
                 savedAuth.clear()
                 message = ""
+            }
+        }
+    }
+
+    val isArduinoConnected = arduinoState is ArduinoConnectionState.Connected
+
+    LaunchedEffect(isArduinoConnected) {
+        if (!isArduinoConnected)
+        {
+            return@LaunchedEffect
+        }
+
+        while (true)
+        {
+            delay(3000)
+
+            try
+            {
+                val status = arduinoRequestMutex.withLock {
+                    arduinoConnection.getStatus()
+                }
+                arduinoState = ArduinoConnectionState.Connected(status)
+            }
+            catch (e: Exception)
+            {
+                message = e.message ?: "Ошибка автообновления Arduino"
             }
         }
     }
@@ -1004,6 +1097,9 @@ fun IrrigationApp(
             arduinoState = arduinoState,
             message = message,
             wifiScanner = wifiScanner,
+            onLoadControllerConfig = { deviceCode ->
+                cloudRepository.loadControllerByCode(session!!, deviceCode)
+            },
             onLogout = {
                 arduinoConnection.disconnect()
                 savedAuth.clear()
@@ -1019,7 +1115,9 @@ fun IrrigationApp(
                     password = password,
                     url = ip,
                     onConnected = {
-                        val status = arduinoConnection.getStatus()
+                        val status = arduinoRequestMutex.withLock {
+                            arduinoConnection.getStatus()
+                        }
                         arduinoState = ArduinoConnectionState.Connected(status)
                     },
                     onError = { error ->
@@ -1036,7 +1134,9 @@ fun IrrigationApp(
                 scope.launch {
                     try
                     {
-                        val status = arduinoConnection.getStatus()
+                        val status = arduinoRequestMutex.withLock {
+                            arduinoConnection.getStatus()
+                        }
                         arduinoState = ArduinoConnectionState.Connected(status)
                         message = ""
                     }
@@ -1050,7 +1150,9 @@ fun IrrigationApp(
                 scope.launch {
                     try
                     {
-                        val status = arduinoConnection.uploadZones(zones)
+                        val status = arduinoRequestMutex.withLock {
+                            arduinoConnection.uploadZones(zones)
+                        }
                         arduinoState = ArduinoConnectionState.Connected(status)
                         message = "Настройки зон загружены в Arduino"
                     }
@@ -1064,7 +1166,9 @@ fun IrrigationApp(
                 scope.launch {
                     try
                     {
-                        val status = arduinoConnection.setPump(enabled, zone)
+                        val status = arduinoRequestMutex.withLock {
+                            arduinoConnection.setPump(enabled, zone)
+                        }
                         arduinoState = ArduinoConnectionState.Connected(status)
                         message = if (enabled) "Полив зоны $zone включён" else "Полив остановлен"
                     }
@@ -1078,7 +1182,9 @@ fun IrrigationApp(
                 scope.launch {
                     try
                     {
-                        val status = arduinoConnection.setMode(auto)
+                        val status = arduinoRequestMutex.withLock {
+                            arduinoConnection.setMode(auto)
+                        }
                         arduinoState = ArduinoConnectionState.Connected(status)
                         message = if (auto) "Автоматический режим включён" else "Ручной режим включён"
                     }
@@ -1335,6 +1441,7 @@ fun MainIrrigationScreen(
     arduinoState: ArduinoConnectionState,
     message: String,
     wifiScanner: WifiScanner,
+    onLoadControllerConfig: suspend (String) -> ControllerConnectionConfig,
     onLogout: () -> Unit,
     onConnect: (String, String, String) -> Unit,
     onDisconnect: () -> Unit,
@@ -1402,6 +1509,7 @@ fun MainIrrigationScreen(
                     arduinoState = arduinoState,
                     zones = zones,
                     wifiScanner = wifiScanner,
+                    onLoadControllerConfig = onLoadControllerConfig,
                     onConnect = onConnect,
                     onDisconnect = onDisconnect,
                     onRefreshArduino = onRefreshArduino,
@@ -1433,6 +1541,7 @@ fun DashboardScreen(
     arduinoState: ArduinoConnectionState,
     zones: List<IrrigationZone>,
     wifiScanner: WifiScanner,
+    onLoadControllerConfig: suspend (String) -> ControllerConnectionConfig,
     onConnect: (String, String, String) -> Unit,
     onDisconnect: () -> Unit,
     onRefreshArduino: () -> Unit,
@@ -1446,6 +1555,9 @@ fun DashboardScreen(
     var networks by remember { mutableStateOf<List<WifiNetworkItem>>(emptyList()) }
     var password by remember { mutableStateOf(AppConfig.DEFAULT_ARDUINO_PASSWORD) }
     var baseUrl by remember { mutableStateOf(AppConfig.DEFAULT_ARDUINO_BASE_URL) }
+    var controllerCode by remember { mutableStateOf("") }
+    var selectedControllerName by remember { mutableStateOf<String?>(null) }
+    var loadingControllerConfig by remember { mutableStateOf(false) }
     var scanning by remember { mutableStateOf(false) }
     var scanMessage by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
@@ -1477,6 +1589,9 @@ fun DashboardScreen(
         scanMessage = scanMessage,
         password = password,
         baseUrl = baseUrl,
+        controllerCode = controllerCode,
+        selectedControllerName = selectedControllerName,
+        loadingControllerConfig = loadingControllerConfig,
         onFindNetworks = {
             when
             {
@@ -1533,7 +1648,44 @@ fun DashboardScreen(
         },
         onNetworkSelected = { network ->
             selectedNetwork = network
+            selectedControllerName = null
             scanMessage = "Выбрано устройство: ${network.ssid}"
+        },
+        onControllerCodeChange = { controllerCode = it },
+        onLoadControllerByCode = {
+            if (controllerCode.trim().isBlank())
+            {
+                scanMessage = "Введите код контроллера."
+            }
+            else
+            {
+                scope.launch {
+                    loadingControllerConfig = true
+                    scanMessage = "Загружаем настройки контроллера из Supabase..."
+                    try
+                    {
+                        val config = onLoadControllerConfig(controllerCode)
+                        selectedControllerName = config.deviceName
+                        selectedNetwork = WifiNetworkItem(
+                            ssid = config.wifiSsid,
+                            secure = config.wifiPassword.isNotBlank(),
+                            signalLevel = 4
+                        )
+                        password = config.wifiPassword
+                        baseUrl = config.baseUrl
+                        controllerCode = config.deviceCode
+                        scanMessage = "Загружены настройки: ${config.deviceName}. Можно подключаться."
+                    }
+                    catch (e: Exception)
+                    {
+                        scanMessage = e.message ?: "Не удалось загрузить контроллер."
+                    }
+                    finally
+                    {
+                        loadingControllerConfig = false
+                    }
+                }
+            }
         },
         onPasswordChange = { password = it },
         onBaseUrlChange = { baseUrl = it },
@@ -1545,7 +1697,8 @@ fun DashboardScreen(
             }
             else
             {
-                scanMessage = "Подключаемся к устройству: ${network.ssid}"
+                val deviceTitle = selectedControllerName ?: network.ssid
+                scanMessage = "Подключаемся к устройству: $deviceTitle"
                 onConnect(network.ssid, password, baseUrl)
             }
         },
@@ -1575,8 +1728,13 @@ fun ConnectionCard(
     scanMessage: String,
     password: String,
     baseUrl: String,
+    controllerCode: String,
+    selectedControllerName: String?,
+    loadingControllerConfig: Boolean,
     onFindNetworks: () -> Unit,
     onNetworkSelected: (WifiNetworkItem) -> Unit,
+    onControllerCodeChange: (String) -> Unit,
+    onLoadControllerByCode: () -> Unit,
     onPasswordChange: (String) -> Unit,
     onBaseUrlChange: (String) -> Unit,
     onConnect: () -> Unit,
@@ -1594,23 +1752,25 @@ fun ConnectionCard(
         }
     }
 
+    val selectedDeviceTitle = selectedControllerName?.takeIf { it.isNotBlank() } ?: selectedNetwork?.ssid
+
     val statusText = when (arduinoState)
     {
         ArduinoConnectionState.Disconnected ->
-            if (selectedNetwork == null)
+            if (selectedDeviceTitle == null)
             {
                 "Контроллер не подключён"
             }
             else
             {
-                "Не подключено к ${selectedNetwork.ssid}"
+                "Не подключено к $selectedDeviceTitle"
             }
 
         ArduinoConnectionState.Connecting ->
-            "Подключение к ${selectedNetwork?.ssid ?: "контроллеру"}..."
+            "Подключение к ${selectedDeviceTitle ?: "контроллеру"}..."
 
         is ArduinoConnectionState.Connected ->
-            "Подключено к ${selectedNetwork?.ssid ?: "контроллеру"}"
+            "Подключено к ${selectedDeviceTitle ?: "контроллеру"}"
     }
 
     Card(shape = RoundedCornerShape(8.dp), colors = CardDefaults.cardColors(containerColor = Color.White)) {
@@ -1637,6 +1797,25 @@ fun ConnectionCard(
 
             if (isConnectionBlockExpanded)
             {
+                Text("Подключение по коду контроллера", fontWeight = FontWeight.Bold)
+
+                BlackOutlinedTextField(
+                    value = controllerCode,
+                    onValueChange = onControllerCodeChange,
+                    label = "Код контроллера, например IRR-1001",
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Button(
+                    onClick = onLoadControllerByCode,
+                    enabled = controllerCode.trim().isNotBlank() && !loadingControllerConfig,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(if (loadingControllerConfig) "Загружаем настройки..." else "Загрузить настройки по коду")
+                }
+
+                Divider()
+
                 Button(
                     onClick = onFindNetworks,
                     enabled = !scanning,
@@ -1650,8 +1829,17 @@ fun ConnectionCard(
                     Text(scanMessage, color = Color(0xFF52796F))
                 }
 
-                val selectedDeviceText = selectedNetwork?.let { "Выбранное устройство: ${it.ssid}" }
-                    ?: "Устройство не выбрано. Нажмите «Найти Wi-Fi контроллер» и выберите сеть Arduino."
+                val selectedDeviceText = when
+                {
+                    selectedControllerName != null && selectedNetwork != null ->
+                        "Выбранное устройство: $selectedControllerName • Wi-Fi: ${selectedNetwork.ssid}"
+
+                    selectedNetwork != null ->
+                        "Выбранное устройство: ${selectedNetwork.ssid}"
+
+                    else ->
+                        "Устройство не выбрано. Введите код контроллера или найдите Wi-Fi сеть Arduino."
+                }
 
                 Text(
                     text = selectedDeviceText,
